@@ -13,6 +13,9 @@ type Visualization struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Options     json.RawMessage `json:"options,omitempty"`
+
+	// The query this visualization belongs to is only set when retrieving a dashboard.
+	Query json.RawMessage `json:"query,omitempty"`
 }
 
 // VisualizationTableColumn ...

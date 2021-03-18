@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,58 +12,198 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/databrickslabs/terraform-provider-databricks/common"
 	"github.com/databrickslabs/terraform-provider-databricks/sqlanalytics/api"
 )
 
-func canonicalize(str string) string {
-	str = regexp.MustCompile(`[()]`).ReplaceAllLiteralString(str, "")
-	str = regexp.MustCompile(`\W`).ReplaceAllLiteralString(str, "_")
-	return strings.ToLower(str)
+type Dashboard struct {
+	RemoteID     string
+	ResourceName string
+
+	Object *api.Dashboard
 }
 
-func loadQuery(path string) (*api.Query, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
+type Widget struct {
+	RemoteID     string
+	ResourceName string
 
-	var q api.Query
-	dec := json.NewDecoder(f)
-	err = dec.Decode(&q)
-	if err != nil {
-		return nil, err
-	}
-
-	return &q, nil
+	Object *api.Widget
 }
 
-func loadDashboard(path string) (*api.Dashboard, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
+type Query struct {
+	RemoteID     string
+	ResourceName string
 
-	var d api.Dashboard
-	dec := json.NewDecoder(f)
-	err = dec.Decode(&d)
-	if err != nil {
-		return nil, err
-	}
-
-	return &d, nil
+	Object *api.Query
 }
 
-func processQuery(path string) {
-	q, err := loadQuery(path)
+type Visualization struct {
+	RemoteID     string
+	ResourceName string
+
+	Object *api.Visualization
+}
+
+type Inventory struct {
+	sqla *api.Wrapper
+
+	Dashboards     []Dashboard
+	Widgets        []Widget
+	Queries        []Query
+	Visualizations []Visualization
+}
+
+func (i *Inventory) loadDashboard(id string) {
+	for _, dp := range i.Dashboards {
+		if dp.RemoteID == id {
+			return
+		}
+	}
+
+	d, err := i.sqla.ReadDashboard(&api.Dashboard{ID: id})
 	if err != nil {
 		panic(err)
 	}
 
-	queryResourceName := canonicalize(q.Name)
-	o, err := os.Create(fmt.Sprintf("query_%s.tf", queryResourceName))
+	dp := Dashboard{
+		RemoteID:     d.ID,
+		ResourceName: canonicalize(d.Name),
+		Object:       d,
+	}
+
+	wps := []Widget{}
+	for i, widget := range d.Widgets {
+		var w api.Widget
+		err := json.Unmarshal(widget, &w)
+		if err != nil {
+			panic(err)
+		}
+
+		// Explicitly link widget to dashboard.
+		w.DashboardID = d.ID
+
+		// Load visualization ID if present.
+		if len(w.Visualization) != 0 {
+			var v api.Visualization
+			err := json.Unmarshal(w.Visualization, &v)
+			if err != nil {
+				panic(err)
+			}
+
+			w.VisualizationID = &v.ID
+		}
+
+		wp := Widget{
+			RemoteID:     strconv.Itoa(w.ID),
+			ResourceName: fmt.Sprintf("%s_%d", dp.ResourceName, i),
+			Object:       &w,
+		}
+
+		wps = append(wps, wp)
+	}
+
+	i.Dashboards = append(i.Dashboards, dp)
+	i.Widgets = append(i.Widgets, wps...)
+
+	// Now recurse into widgets to find visualizations.
+	for _, wp := range wps {
+		if len(wp.Object.Visualization) == 0 {
+			continue
+		}
+
+		var v api.Visualization
+		err := json.Unmarshal(wp.Object.Visualization, &v)
+		if err != nil {
+			panic(err)
+		}
+
+		if v.Query != nil {
+			var q api.Query
+			err := json.Unmarshal(v.Query, &q)
+			if err != nil {
+				panic(err)
+			}
+
+			i.loadQuery(q.ID)
+		}
+	}
+}
+
+func (i *Inventory) loadQuery(id string) {
+	for _, qp := range i.Queries {
+		if qp.RemoteID == id {
+			return
+		}
+	}
+
+	q, err := i.sqla.ReadQuery(&api.Query{ID: id})
 	if err != nil {
 		panic(err)
 	}
+
+	qp := Query{
+		RemoteID:     q.ID,
+		ResourceName: canonicalize(q.Name),
+		Object:       q,
+	}
+
+	vps := []Visualization{}
+	for _, visualization := range qp.Object.Visualizations {
+		var v api.Visualization
+		err := json.Unmarshal(visualization, &v)
+		if err != nil {
+			panic(err)
+		}
+
+		// Explicitly link visualization to query.
+		v.QueryID = q.ID
+
+		vp := Visualization{
+			RemoteID:     strconv.Itoa(v.ID),
+			ResourceName: "",
+			Object:       &v,
+		}
+
+		vps = append(vps, vp)
+	}
+
+	// Figure out number of visualizations per type.
+	// If there's only one, we don't need to suffix the index.
+	vtyp := make(map[string]int)
+	for _, vp := range vps {
+		typ := strings.ToLower(vp.Object.Type)
+		vtyp[typ]++
+	}
+
+	// Second pass to synthesize resource name for visualization.
+	vtypSeq := make(map[string]int)
+	for i := range vps {
+		vp := &vps[i]
+		typ := strings.ToLower(vp.Object.Type)
+		if vtyp[typ] == 1 {
+			vp.ResourceName = fmt.Sprintf("%s_%s", qp.ResourceName, typ)
+		} else {
+			vp.ResourceName = fmt.Sprintf("%s_%s_%d", qp.ResourceName, typ, vtypSeq[typ])
+			vtypSeq[typ]++
+		}
+	}
+
+	i.Queries = append(i.Queries, qp)
+	i.Visualizations = append(i.Visualizations, vps...)
+}
+
+func (i *Inventory) writeQueries() {
+	for _, qp := range i.Queries {
+		i.writeQuery(qp)
+	}
+}
+
+func (i *Inventory) writeQuery(qp Query) {
+	o, err := os.Create(fmt.Sprintf("query_%s.tf", qp.ResourceName))
+	if err != nil {
+		panic(err)
+	}
+
 	defer o.Close()
 
 	x := func(format string, a ...interface{}) {
@@ -87,7 +228,9 @@ func processQuery(path string) {
 		x(`]`)
 	}
 
-	x(`resource "databricks_sql_query" "%s" {`, queryResourceName)
+	q := qp.Object
+
+	x(`resource "databricks_sql_query" "%s" {`, qp.ResourceName)
 	x("data_source_id = %s", strconv.Quote(q.DataSourceID))
 	x(`name = %s`, strconv.Quote(q.Name))
 
@@ -214,18 +357,13 @@ func processQuery(path string) {
 	x(`}`)
 
 	// Move on to visualizations.
-	visualizationTypeCounter := make(map[string]int)
-	for _, viz := range q.Visualizations {
-		var v api.Visualization
-		err = json.Unmarshal(viz, &v)
-		if err != nil {
-			panic(err)
+	for _, vp := range i.Visualizations {
+		if vp.Object.QueryID != qp.RemoteID {
+			continue
 		}
 
+		v := vp.Object
 		typ := strings.ToLower(v.Type)
-		seq := visualizationTypeCounter[typ]
-		visualizationTypeCounter[typ]++
-		visualizationResourceName := fmt.Sprintf("%s_%s_%d", queryResourceName, typ, seq)
 
 		// Sanitize options to remove superfluous defaults.
 		if typ == "table" {
@@ -254,8 +392,8 @@ func processQuery(path string) {
 		}
 
 		x(``)
-		x(`resource "databricks_sql_visualization" "%s" {`, visualizationResourceName)
-		x(`query_id = databricks_sql_query.%s.id`, queryResourceName)
+		x(`resource "databricks_sql_visualization" "%s" {`, vp.ResourceName)
+		x(`query_id = databricks_sql_query.%s.id`, qp.ResourceName)
 		x(`type = %s`, strconv.Quote(typ))
 		x(`name = %s`, strconv.Quote(v.Name))
 		if v.Description != "" {
@@ -269,17 +407,18 @@ func processQuery(path string) {
 	}
 }
 
-func processDashboard(path string) {
-	d, err := loadDashboard(path)
+func (i *Inventory) writeDashboards() {
+	for _, dp := range i.Dashboards {
+		i.writeDashboard(dp)
+	}
+}
+
+func (i *Inventory) writeDashboard(dp Dashboard) {
+	o, err := os.Create(fmt.Sprintf("dashboard_%s.tf", dp.ResourceName))
 	if err != nil {
 		panic(err)
 	}
 
-	dashboardResourceName := canonicalize(d.Name)
-	o, err := os.Create(fmt.Sprintf("dashboard_%s.tf", dashboardResourceName))
-	if err != nil {
-		panic(err)
-	}
 	defer o.Close()
 
 	x := func(format string, a ...interface{}) {
@@ -304,35 +443,43 @@ func processDashboard(path string) {
 		x(`]`)
 	}
 
-	x(`resource "databricks_sql_dashboard" "%s" {`, dashboardResourceName)
+	d := dp.Object
+
+	x(`resource "databricks_sql_dashboard" "%s" {`, dp.ResourceName)
 	x(`name = %s`, strconv.Quote(d.Name))
 	x(``)
 	xStrings(`tags`, d.Tags)
 	x(`}`)
 
 	// Move on to widgets.
-	counter := 0
-	for _, widget := range d.Widgets {
-		var w api.Widget
-		err = json.Unmarshal(widget, &w)
-		if err != nil {
-			panic(err)
+	for _, wp := range i.Widgets {
+		if wp.Object.DashboardID != dp.RemoteID {
+			continue
 		}
 
-		seq := counter
-		counter++
-		widgetResourceName := fmt.Sprintf("%s_%d", dashboardResourceName, seq)
+		w := wp.Object
 
 		x(``)
-		x(`resource "databricks_sql_widget" "%s" {`, widgetResourceName)
-		x(`dashboard_id = databricks_sql_dashboard.%s.id`, dashboardResourceName)
-		if w.Visualization != nil {
-			var v api.Visualization
-			err = json.Unmarshal(w.Visualization, &v)
-			if err != nil {
-				panic(err)
+		x(`resource "databricks_sql_widget" "%s" {`, wp.ResourceName)
+		x(`dashboard_id = databricks_sql_dashboard.%s.id`, dp.ResourceName)
+		if w.VisualizationID != nil {
+			fmt.Printf("Looking for visualization %d\n", *w.VisualizationID)
+
+			// Look up the right visualization.
+			var vp *Visualization
+			for _, vpp := range i.Visualizations {
+				log.Printf("vpp.RemoteID: %s", vpp.RemoteID)
+				if vpp.RemoteID == strconv.Itoa(*w.VisualizationID) {
+					vp = &vpp
+					break
+				}
 			}
-			x(`visualization_id = "%d"`, v.ID)
+
+			if vp == nil {
+				log.Fatalf("Couldn't find visualization...")
+			}
+
+			x(`visualization_id = databricks_sql_visualization.%s.id`, vp.ResourceName)
 		} else {
 			x(`text = <<EOT`)
 			if w.Text != nil {
@@ -377,9 +524,41 @@ func processDashboard(path string) {
 	}
 }
 
+func canonicalize(str string) string {
+	str = regexp.MustCompile(`[()]`).ReplaceAllLiteralString(str, "")
+	str = regexp.MustCompile(`\W`).ReplaceAllLiteralString(str, "_")
+	return strings.ToLower(str)
+}
+
+var inventory Inventory
+
+var profile = flag.String("profile", "", "Profile name in ~/.databrickscfg to use.")
+var mode = flag.String("mode", "dashboard", `Pick "dashboard" or "query" mode.`)
+
 func main() {
 	flag.Parse()
-	for _, arg := range flag.Args() {
-		processDashboard(arg)
+
+	client := common.DatabricksClient{Profile: *profile}
+	if err := client.Configure(); err != nil {
+		panic(err)
 	}
+
+	sqla := api.NewWrapper(context.Background(), &client)
+	inv := Inventory{sqla: &sqla}
+
+	switch *mode {
+	case "dashboard":
+		for _, arg := range flag.Args() {
+			inv.loadDashboard(arg)
+		}
+	case "query":
+		for _, arg := range flag.Args() {
+			inv.loadQuery(arg)
+		}
+	default:
+		log.Fatalf(`Unknown mode: %s`, *mode)
+	}
+
+	inv.writeQueries()
+	inv.writeDashboards()
 }
