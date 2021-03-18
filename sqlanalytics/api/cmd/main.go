@@ -463,12 +463,9 @@ func (i *Inventory) writeDashboard(dp Dashboard) {
 		x(`resource "databricks_sql_widget" "%s" {`, wp.ResourceName)
 		x(`dashboard_id = databricks_sql_dashboard.%s.id`, dp.ResourceName)
 		if w.VisualizationID != nil {
-			fmt.Printf("Looking for visualization %d\n", *w.VisualizationID)
-
 			// Look up the right visualization.
 			var vp *Visualization
 			for _, vpp := range i.Visualizations {
-				log.Printf("vpp.RemoteID: %s", vpp.RemoteID)
 				if vpp.RemoteID == strconv.Itoa(*w.VisualizationID) {
 					vp = &vpp
 					break
