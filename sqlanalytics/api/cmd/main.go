@@ -511,6 +511,12 @@ func (i *Inventory) writeDashboard(dp Dashboard) {
 				// Nothing
 			case string:
 				x(`value = %s`, strconv.Quote(pvt))
+			case []interface{}:
+				x(`values = [`)
+				for _, iface := range pvt {
+					x("%s,", strconv.Quote(iface.(string)))
+				}
+				x(`]`)
 			default:
 				panic(fmt.Errorf("Unhandled value type: %#v", reflect.TypeOf(pv.Value)))
 			}
